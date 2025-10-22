@@ -13,6 +13,8 @@
   - [Модуль 9: Зависимости (Dependencies) и внедрение](#модуль-9-зависимости-dependencies-и-внедрение)
   - [Модуль 10: Тестирование](#модуль-10-тестирование)
   - [Модуль 11: Деплой и DevOps](#модуль-11-деплой-и-devops)
+  - [Модуль 12: Бизнес логика (services)](#модуль-12-бизнес-логика-services)
+  - [Модуль 13: Репозитории (repository)](#модуль-13-репозитории-repository)
 
 ## Модуль 1: Асинхронное программирование
  - [содержание](#содержание)
@@ -1908,3 +1910,719 @@ kubectl apply -f deployment.yaml
 ```
 
 Начни с простого пайплайна (сборка → тесты → деплой), затем добавляй сложность. Для продакшена обязательно настрой HTTPS, мониторинг и логирование.
+
+## Модуль 12: Бизнес логика (services)
+
+- [содержание](#содержание)
+
+## Что такое сервисный слой?
+
+**Services** - это слой бизнес-логики, который отделяет работу с данными от HTTP-запросов. Сервисы содержат всю бизнес-логику приложения.
+
+## Зачем нужны сервисы?
+
+- **Разделение ответственности** - эндпоинты занимаются HTTP, сервисы - логикой
+- **Повторное использование** - одна логика в разных эндпоинтах
+- **Тестируемость** - легко тестировать бизнес-логику без HTTP
+- **Чистота кода** - эндпоинты остаются тонкими и понятными
+
+## Базовая структура
+
+### Без сервисов (плохо)
+```python
+@app.post("/users/")
+async def create_user(
+    user_data: UserCreate,
+    db: Session = Depends(get_db)
+):
+    # ВСЯ логика в эндпоинте - плохо!
+    if db.query(User).filter(User.email == user_data.email).first():
+        raise HTTPException(400, "Email exists")
+    
+    hashed_password = hash_password(user_data.password)
+    user = User(
+        email=user_data.email,
+        hashed_password=hashed_password
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+```
+
+### С сервисами (хорошо)
+```python
+# services/user_service.py
+class UserService:
+    def __init__(self, user_repository: UserRepository):
+        self.user_repo = user_repo
+    
+    def create_user(self, user_data: UserCreate) -> User:
+        if self.user_repo.get_by_email(user_data.email):
+            raise ValueError("Email already exists")
+        
+        hashed_password = hash_password(user_data.password)
+        user = User(
+            email=user_data.email,
+            hashed_password=hashed_password
+        )
+        return self.user_repo.add(user)
+
+# endpoints/users.py
+@app.post("/users/")
+async def create_user(
+    user_data: UserCreate,
+    user_service: UserService = Depends(get_user_service)
+):
+    try:
+        user = user_service.create_user(user_data)
+        return user
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+```
+
+## Реализация сервисного слоя
+
+### Базовый сервис
+```python
+from abc import ABC, abstractmethod
+from typing import List, Optional
+
+class BaseService(ABC):
+    @abstractmethod
+    def get_by_id(self, id: int):
+        pass
+    
+    @abstractmethod
+    def create(self, data):
+        pass
+    
+    @abstractmethod
+    def update(self, id: int, data):
+        pass
+    
+    @abstractmethod
+    def delete(self, id: int):
+        pass
+```
+
+### Конкретный сервис
+```python
+class UserService(BaseService):
+    def __init__(self, user_repository: UserRepository):
+        self.user_repo = user_repository
+    
+    def get_by_id(self, user_id: int) -> User:
+        user = self.user_repo.get(user_id)
+        if not user:
+            raise ValueError("User not found")
+        return user
+    
+    def get_by_email(self, email: str) -> Optional[User]:
+        return self.user_repo.get_by_email(email)
+    
+    def create(self, user_data: UserCreate) -> User:
+        # Проверка бизнес-правил
+        if self.get_by_email(user_data.email):
+            raise ValueError("User with this email already exists")
+        
+        if len(user_data.password) < 8:
+            raise ValueError("Password too short")
+        
+        # Создание пользователя
+        hashed_password = hash_password(user_data.password)
+        user = User(
+            email=user_data.email,
+            hashed_password=hashed_password,
+            is_active=True
+        )
+        return self.user_repo.add(user)
+    
+    def update(self, user_id: int, user_data: UserUpdate) -> User:
+        user = self.get_by_id(user_id)
+        
+        if user_data.email and user_data.email != user.email:
+            if self.get_by_email(user_data.email):
+                raise ValueError("Email already taken")
+            user.email = user_data.email
+        
+        if user_data.password:
+            user.hashed_password = hash_password(user_data.password)
+        
+        return self.user_repo.update(user)
+    
+    def delete(self, user_id: int):
+        user = self.get_by_id(user_id)
+        self.user_repo.delete(user.id)
+```
+
+## Интеграция с FastAPI
+
+### Зависимости для сервисов
+```python
+# dependencies.py
+from services.user_service import UserService
+from repositories.user_repository import UserRepository
+
+def get_user_service(db: Session = Depends(get_db)) -> UserService:
+    user_repo = UserRepository(db)
+    return UserService(user_repo)
+
+def get_auth_service(db: Session = Depends(get_db)) -> AuthService:
+    user_repo = UserRepository(db)
+    return AuthService(user_repo)
+```
+
+### Использование в эндпоинтах
+```python
+# endpoints/users.py
+@app.post("/users/", response_model=UserResponse)
+async def create_user(
+    user_data: UserCreate,
+    user_service: UserService = Depends(get_user_service)
+):
+    try:
+        user = user_service.create(user_data)
+        return user
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e))
+
+@app.get("/users/{user_id}", response_model=UserResponse)
+async def get_user(
+    user_id: int,
+    user_service: UserService = Depends(get_user_service)
+):
+    try:
+        user = user_service.get_by_id(user_id)
+        return user
+    except ValueError as e:
+        raise HTTPException(404, detail=str(e))
+```
+
+## Сложная бизнес-логика
+
+### Сервис с несколькими репозиториями
+```python
+class OrderService:
+    def __init__(
+        self,
+        order_repo: OrderRepository,
+        user_repo: UserRepository,
+        product_repo: ProductRepository
+    ):
+        self.order_repo = order_repo
+        self.user_repo = user_repo
+        self.product_repo = product_repo
+    
+    def create_order(self, order_data: OrderCreate) -> Order:
+        # Проверяем пользователя
+        user = self.user_repo.get(order_data.user_id)
+        if not user:
+            raise ValueError("User not found")
+        
+        # Проверяем товары
+        total_price = 0
+        for item in order_data.items:
+            product = self.product_repo.get(item.product_id)
+            if not product:
+                raise ValueError(f"Product {item.product_id} not found")
+            if product.stock < item.quantity:
+                raise ValueError(f"Not enough stock for {product.name}")
+            
+            total_price += product.price * item.quantity
+        
+        # Создаем заказ
+        order = Order(
+            user_id=user.id,
+            total_price=total_price,
+            status="pending"
+        )
+        
+        order = self.order_repo.add(order)
+        
+        # Обновляем остатки
+        for item in order_data.items:
+            product = self.product_repo.get(item.product_id)
+            product.stock -= item.quantity
+            self.product_repo.update(product)
+        
+        return order
+```
+
+## Сервисы для аутентификации
+
+### Auth Service
+```python
+class AuthService:
+    def __init__(self, user_repository: UserRepository):
+        self.user_repo = user_repository
+    
+    def authenticate(self, email: str, password: str) -> User:
+        user = self.user_repo.get_by_email(email)
+        if not user:
+            raise ValueError("Invalid credentials")
+        
+        if not verify_password(password, user.hashed_password):
+            raise ValueError("Invalid credentials")
+        
+        if not user.is_active:
+            raise ValueError("User account is disabled")
+        
+        return user
+    
+    def change_password(self, user_id: int, old_password: str, new_password: str):
+        user = self.user_repo.get(user_id)
+        if not verify_password(old_password, user.hashed_password):
+            raise ValueError("Current password is incorrect")
+        
+        user.hashed_password = hash_password(new_password)
+        return self.user_repo.update(user)
+```
+
+## Тестирование сервисов
+
+### Unit-тесты
+```python
+import pytest
+from unittest.mock import Mock
+from services.user_service import UserService
+
+def test_create_user_success():
+    # Mock репозитория
+    mock_repo = Mock()
+    mock_repo.get_by_email.return_value = None
+    
+    user_service = UserService(mock_repo)
+    user_data = UserCreate(
+        email="test@example.com",
+        password="securepassword"
+    )
+    
+    user = user_service.create(user_data)
+    
+    assert user is not None
+    mock_repo.add.assert_called_once()
+
+def test_create_user_duplicate_email():
+    mock_repo = Mock()
+    mock_repo.get_by_email.return_value = User(email="test@example.com")
+    
+    user_service = UserService(mock_repo)
+    user_data = UserCreate(
+        email="test@example.com", 
+        password="password"
+    )
+    
+    with pytest.raises(ValueError, match="already exists"):
+        user_service.create(user_data)
+```
+
+### Интеграционные тесты
+```python
+def test_user_service_integration(db_session):
+    user_repo = UserRepository(db_session)
+    user_service = UserService(user_repo)
+    
+    user_data = UserCreate(
+        email="test@example.com",
+        password="password123"
+    )
+    
+    user = user_service.create(user_data)
+    
+    assert user.id is not None
+    assert user.email == "test@example.com"
+    assert user.is_active is True
+```
+
+## Лучшие практики
+
+### 1. Один сервис - одна ответственность
+```python
+# ХОРОШО
+class UserService:  # Только пользователи
+class ProductService:  # Только товары
+class OrderService:  # Только заказы
+
+# ПЛОХО
+class EverythingService:  # Все в одном
+```
+
+### 2. Сервисы не знают о HTTP
+```python
+# ХОРОШО - кидает обычные исключения
+raise ValueError("User not found")
+
+# ПЛОХО - сервис знает о HTTP
+raise HTTPException(404, "User not found")
+```
+
+### 3. Использование DTO (Data Transfer Objects)
+```python
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+
+class UserResponse(BaseModel):
+    id: int
+    email: EmailStr
+    is_active: bool
+    
+    class Config:
+        orm_mode = True
+```
+
+### 4. Внедрение зависимостей
+```python
+# ХОРОШО - зависимости передаются извне
+class UserService:
+    def __init__(self, user_repo: UserRepository):
+        self.user_repo = user_repo
+
+# ПЛОХО - зависимости создаются внутри
+class UserService:
+    def __init__(self):
+        self.user_repo = UserRepository()  # Сложно тестировать
+```
+
+## Преимущества сервисного слоя
+
+### 1. **Чистая архитектура**
+- Эндпоинты = HTTP логика
+- Сервисы = бизнес-логика  
+- Репозитории = работа с данными
+
+### 2. **Легкое тестирование**
+```python
+# Тестируем бизнес-логику без FastAPI
+def test_business_logic():
+    service = UserService(mock_repo)
+    result = service.create_user(...)
+    assert result ...
+```
+
+### 3. **Повторное использование**
+```python
+# Один сервис можно использовать в:
+# - REST API
+# - WebSocket
+# - CLI командах
+# - Фоновых задачах
+```
+
+### 4. **Поддержка и развитие**
+- Легко находить и исправлять баги
+- Просто добавлять новую функциональность
+- Упрощенный онбординг новых разработчиков
+
+Сервисный слой делает ваше FastAPI приложение масштабируемым, тестируемым и поддерживаемым, отделяя бизнес-логику от транспортного слоя.
+
+## Модуль 13: Репозитории (repository)
+
+- [содержание](#содержание)
+
+## Что такое паттерн Repository?
+
+**Repository** - это прослойка между бизнес-логикой и слоем данных, которая инкапсулирует всю работу с базой данных.
+
+## Зачем это нужно?
+
+- **Отделение бизнес-логики** от деталей хранения данных
+- **Упрощение тестирования** - можно мокать репозиторий
+- **Единая точка** для всех операций с сущностью
+- **Гибкость** - легко сменить способ хранения данных
+
+## Базовая структура
+
+### 1. Абстрактный репозиторий
+```python
+from abc import ABC, abstractmethod
+from typing import List, Optional
+
+class IRepository(ABC):
+    @abstractmethod
+    def get(self, id: int):
+        pass
+    
+    @abstractmethod
+    def get_all(self) -> List:
+        pass
+    
+    @abstractmethod
+    def add(self, entity):
+        pass
+    
+    @abstractmethod
+    def update(self, entity):
+        pass
+    
+    @abstractmethod
+    def delete(self, id: int):
+        pass
+```
+
+### 2. Репозиторий для конкретной модели
+```python
+from sqlalchemy.orm import Session
+
+class UserRepository(IRepository):
+    def __init__(self, session: Session):
+        self.session = session
+    
+    def get(self, user_id: int) -> Optional[User]:
+        return self.session.query(User).filter(User.id == user_id).first()
+    
+    def get_all(self) -> List[User]:
+        return self.session.query(User).all()
+    
+    def get_by_email(self, email: str) -> Optional[User]:
+        return self.session.query(User).filter(User.email == email).first()
+    
+    def add(self, user: User) -> User:
+        self.session.add(user)
+        self.session.commit()
+        self.session.refresh(user)
+        return user
+    
+    def update(self, user: User) -> User:
+        self.session.commit()
+        self.session.refresh(user)
+        return user
+    
+    def delete(self, user_id: int):
+        user = self.get(user_id)
+        if user:
+            self.session.delete(user)
+            self.session.commit()
+```
+
+## Использование в бизнес-логике
+
+### Сервисный слой
+```python
+class UserService:
+    def __init__(self, user_repository: UserRepository):
+        self.user_repo = user_repository
+    
+    def register_user(self, username: str, email: str) -> User:
+        # Проверяем, нет ли уже пользователя
+        if self.user_repo.get_by_email(email):
+            raise ValueError("User with this email already exists")
+        
+        # Создаем нового пользователя
+        user = User(username=username, email=email)
+        return self.user_repo.add(user)
+    
+    def get_user_profile(self, user_id: int) -> User:
+        user = self.user_repo.get(user_id)
+        if not user:
+            raise ValueError("User not found")
+        return user
+```
+
+## Интеграция с FastAPI
+
+### Зависимости
+```python
+from fastapi import Depends
+from sqlalchemy.orm import Session
+
+def get_db() -> Session:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def get_user_repository(db: Session = Depends(get_db)) -> UserRepository:
+    return UserRepository(db)
+
+@app.post("/users/")
+async def create_user(
+    username: str,
+    email: str,
+    user_service: UserService = Depends(get_user_service)
+):
+    user = user_service.register_user(username, email)
+    return user
+```
+
+### Фабрика для сервисов
+```python
+def get_user_service(db: Session = Depends(get_db)) -> UserService:
+    user_repo = UserRepository(db)
+    return UserService(user_repo)
+```
+
+## Расширенный репозиторий
+
+### Базовый репозиторий с общими методами
+```python
+class BaseRepository(IRepository):
+    def __init__(self, session: Session, model):
+        self.session = session
+        self.model = model
+    
+    def get(self, id: int):
+        return self.session.query(self.model).filter(self.model.id == id).first()
+    
+    def get_all(self):
+        return self.session.query(self.model).all()
+    
+    def add(self, entity):
+        self.session.add(entity)
+        self.session.commit()
+        self.session.refresh(entity)
+        return entity
+    
+    def update(self, entity):
+        self.session.commit()
+        self.session.refresh(entity)
+        return entity
+    
+    def delete(self, id: int):
+        entity = self.get(id)
+        if entity:
+            self.session.delete(entity)
+            self.session.commit()
+    
+    def filter(self, **filters):
+        query = self.session.query(self.model)
+        for key, value in filters.items():
+            query = query.filter(getattr(self.model, key) == value)
+        return query.all()
+```
+
+### Специализированные репозитории
+```python
+class UserRepository(BaseRepository):
+    def __init__(self, session: Session):
+        super().__init__(session, User)
+    
+    def get_by_email(self, email: str) -> Optional[User]:
+        return self.session.query(User).filter(User.email == email).first()
+    
+    def get_active_users(self) -> List[User]:
+        return self.session.query(User).filter(User.is_active == True).all()
+    
+    def search_by_username(self, username: str) -> List[User]:
+        return self.session.query(User).filter(
+            User.username.ilike(f"%{username}%")
+        ).all()
+```
+
+## Unit of Work паттерн
+
+### Для сложных транзакций
+```python
+class UnitOfWork:
+    def __init__(self, session: Session):
+        self.session = session
+        self.users = UserRepository(session)
+        self.posts = PostRepository(session)
+    
+    def commit(self):
+        self.session.commit()
+    
+    def rollback(self):
+        self.session.rollback()
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, traceback):
+        if exc_type:
+            self.rollback()
+        else:
+            self.commit()
+
+# Использование
+def create_user_with_posts(user_data: dict, posts_data: list):
+    with UnitOfWork(SessionLocal()) as uow:
+        user = uow.users.add(User(**user_data))
+        
+        for post_data in posts_data:
+            post = Post(**post_data, user_id=user.id)
+            uow.posts.add(post)
+        
+        # Автоматический коммит при успехе
+        # И rollback при ошибке
+```
+
+## Тестирование
+
+### Mock репозитория
+```python
+from unittest.mock import Mock
+
+def test_user_service():
+    # Создаем mock репозитория
+    mock_repo = Mock(spec=UserRepository)
+    mock_repo.get_by_email.return_value = None
+    mock_repo.add.return_value = User(id=1, username="test", email="test@test.com")
+    
+    # Тестируем сервис
+    service = UserService(mock_repo)
+    user = service.register_user("test", "test@test.com")
+    
+    assert user.id == 1
+    mock_repo.get_by_email.assert_called_once_with("test@test.com")
+    mock_repo.add.assert_called_once()
+```
+
+### Тесты с реальной БД
+```python
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+@pytest.fixture
+def db_session():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    yield session
+    session.close()
+
+def test_user_repository(db_session):
+    repo = UserRepository(db_session)
+    user = User(username="test", email="test@test.com")
+    
+    # Тестируем методы репозитория
+    saved_user = repo.add(user)
+    assert saved_user.id is not None
+    
+    found_user = repo.get(saved_user.id)
+    assert found_user.username == "test"
+```
+
+## Преимущества паттерна Repository
+
+### 1. **Чистая архитектура**
+```python
+# Бизнес-логика не знает о SQLAlchemy
+class UserService:
+    def __init__(self, user_repo: IRepository):
+        self.repo = user_repo  # Работает с любым репозиторием
+```
+
+### 2. **Легкое тестирование**
+```python
+# Тесты без реальной БД
+def test_service_with_mock():
+    mock_repo = Mock()
+    service = UserService(mock_repo)
+    # ... тестируем логику
+```
+
+### 3. **Гибкость**
+- Можно легко добавить кеширование
+- Сменить базу данных
+- Добавить логирование операций
+
+### 4. **Единообразие**
+- Все операции с сущностью в одном месте
+- Стандартные методы для всех моделей
+
+Паттерн Repository делает код более поддерживаемым, тестируемым и гибким, отделяя бизнес-логику от деталей хранения данных.

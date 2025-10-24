@@ -7,8 +7,13 @@ from app.schemas.user_schema import UserResponse
 from app.services.jwt_handler import get_current_user
 from app.models.user_model import User
 
+# инициализация роутера для пути /api/v1/users/...
 router = APIRouter(prefix="/users", tags=["users"])
 
+
+# endpoint для получения данных о текущем пользователе имеет путь /api/v1/users/me
 @router.get("/me", response_model=UserResponse)
-async def read_users_me(current_user: User = Depends(get_current_user)):
+async def read_users_me(
+    current_user: User = Depends(get_current_user) # зависимость получающая пользователя по токену из куки
+):
     return current_user

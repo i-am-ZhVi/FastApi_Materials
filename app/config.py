@@ -1,6 +1,7 @@
 from pydantic_settings import BaseSettings
 from typing import Optional
 
+# Настройки приложения хранящиеся в не публичном файле .env
 class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:6500/fastapi"
     SECRET_KEY: str = "your-secret-key-here-change-in-production"

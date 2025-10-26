@@ -35,21 +35,6 @@ services:
     networks:
       - fastapi_network
 
-  tests:
-    build: .
-    container_name: fastapi_tests
-    command: >
-      sh -c "pytest --cov=app --cov-report=term-missing"
-    environment:
-      - DATABASE_URL=sqlite+aiosqlite:///./test.db
-    volumes:
-      - .:/app
-    depends_on:
-      postgres:
-        condition: service_healthy
-    networks:
-      - fastapi_network
-
 volumes:
   postgres_data:
 
